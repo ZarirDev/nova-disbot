@@ -37,7 +37,8 @@ mkdir -p ./build
 success "Build directory ready"
 
 progress "Compiling Go application..."
-go build -v -o ./build/nova-disbot main.go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -o ./build/nova-disbot .
+# go build -v -o ./build/nova-disbot main.go
 success "Compilation complete"
 
 progress "Copying environment template..."

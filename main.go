@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,7 +12,6 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
-	_ "github.com/mattn/go-sqlite3"
 )
 
 var (
@@ -44,13 +42,11 @@ const (
 
 type Monitor struct {
 	mu              sync.Mutex
-	db              *sql.DB
 	state           ServerState
 	consecutiveFail int
 	consecutiveSucc int
 	lastLatency     time.Duration
 	lastCheck       time.Time
-	currentIncident int64
 }
 
 func getEnv(key, fallback string) string {
@@ -65,23 +61,13 @@ func main() {
 		log.Fatal("Error: DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID environment variables must be set.")
 	}
 
-	// 1. Initialize SQLite Database
-	db, err := sql.Open("sqlite3", "./monitor.db")
-	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
-	}
-	defer db.Close()
-
-	createTables(db)
-
-	// 2. Initialize Discord Session
+	// Initialize Discord Session
 	sess, err := discordgo.New("Bot " + Token)
 	if err != nil {
 		log.Fatalf("Error creating Discord session: %v", err)
 	}
 
 	monitor := &Monitor{
-		db:    db,
 		state: StateOnline,
 	}
 
@@ -104,9 +90,9 @@ func main() {
 
 	registerCommands(sess)
 
-	log.Printf("Bot started. Monitoring Cloudflare target URL: %s", TargetURL)
+	log.Printf("Bot started. Monitoring target URL: %s", TargetURL)
 
-	// 3. Start Background Monitoring Loop
+	// Start Background Monitoring Loop
 	go monitor.startLoop(sess)
 
 	stop := make(chan os.Signal, 1)
@@ -115,49 +101,22 @@ func main() {
 	log.Println("Shutting down nova-disbot...")
 }
 
-func createTables(db *sql.DB) {
-	query := `
-	CREATE TABLE IF NOT EXISTS incidents (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		started_at DATETIME,
-		ended_at DATETIME,
-		cause TEXT
-	);
-	CREATE TABLE IF NOT EXISTS checks (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		checked_at DATETIME,
-		success BOOLEAN,
-		latency_ms INTEGER
-	);
-	`
-	if _, err := db.Exec(query); err != nil {
-		log.Fatalf("Failed to create tables: %v", err)
-	}
-}
-
 func (m *Monitor) startLoop(s *discordgo.Session) {
 	ticker := time.NewTicker(CheckInterval)
 	for range ticker.C {
 		success, latency := checkURL(TargetURL)
 		now := time.Now()
 
-		// Safely write check metrics with Mutex lock
 		m.mu.Lock()
 		m.lastCheck = now
 		m.lastLatency = latency
-		m.mu.Unlock()
 
-		m.db.Exec("INSERT INTO checks (checked_at, success, latency_ms) VALUES (?, ?, ?)",
-			now.UTC(), success, latency.Milliseconds())
-
-		m.mu.Lock()
 		if success {
 			m.consecutiveSucc++
 			m.consecutiveFail = 0
 
 			if m.state == StateOffline && m.consecutiveSucc >= RecoveryLimit {
 				m.state = StateOnline
-				m.resolveIncidentLocked()
 				m.mu.Unlock()
 				s.ChannelMessageSend(AlertChannelID, fmt.Sprintf("🟢 **Server Recovered!**\nTarget ` %s ` is back online.", TargetURL))
 			} else {
@@ -169,7 +128,6 @@ func (m *Monitor) startLoop(s *discordgo.Session) {
 
 			if m.state == StateOnline && m.consecutiveFail >= FailureLimit {
 				m.state = StateOffline
-				m.startNewIncidentLocked()
 				m.mu.Unlock()
 				s.ChannelMessageSend(AlertChannelID, fmt.Sprintf("🔴 **Server Went Offline!**\nCritical: Target ` %s ` failed %d consecutive checks.", TargetURL, FailureLimit))
 			} else {
@@ -193,28 +151,11 @@ func checkURL(url string) (bool, time.Duration) {
 	}
 	defer resp.Body.Close()
 
-	// Cloudflare gateway errors or non-200 responses mean the backend server is down
 	if resp.StatusCode != http.StatusOK {
 		return false, latency
 	}
 
 	return true, latency
-}
-
-// Must be called with m.mu locked
-func (m *Monitor) startNewIncidentLocked() {
-	res, err := m.db.Exec("INSERT INTO incidents (started_at, cause) VALUES (?, ?)", time.Now().UTC(), "connectivity")
-	if err == nil {
-		m.currentIncident, _ = res.LastInsertId()
-	}
-}
-
-// Must be called with m.mu locked
-func (m *Monitor) resolveIncidentLocked() {
-	if m.currentIncident != 0 {
-		m.db.Exec("UPDATE incidents SET ended_at = ? WHERE id = ?", time.Now().UTC(), m.currentIncident)
-		m.currentIncident = 0
-	}
 }
 
 func registerCommands(s *discordgo.Session) {
