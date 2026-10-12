@@ -42,7 +42,6 @@ success "Compilation complete"
 
 progress "Copying environment template..."
 cp ./.env.example ./build/.env
-cp ./run.sh ./build/run.sh
 success "Environment template copied"
 
 progress "Checking build artifact..."
